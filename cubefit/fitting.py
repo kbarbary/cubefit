@@ -5,6 +5,7 @@ import logging
 
 import numpy as np
 from scipy.optimize import fmin_l_bfgs_b, fmin_bfgs, fmin
+import iminuit
 
 from .utils import yxbounds
 
@@ -539,19 +540,90 @@ def fit_position_sky_sn_multi(galaxy, datas, weights, ctrs0, snctr0, atms):
 
     bounds = zip(minbound, maxbound)  # [(y0min, y0max), (x0min, x0max), ...]
 
+    def objective_func(*allctrs):
+
+        allctrs = np.array(allctrs)
+        if (allctrs < minbound).any() or (allctrs > maxbound).any():
+            return np.inf
+        chisq, grad = chisq_position_sky_sn_multi(allctrs, galaxy, datas,
+                                                  weights, atms)
+        return chisq
+
+
     def callback(params):
         for i in range(len(params)//2-1):
             logging.debug('Epoch %s: %s, %s', i, params[2*i], params[2*i+1])
         logging.debug('SN position %s, %s', params[-2], params[-1])
-    logging.debug('Bounds:')
-    callback(bounds)
-    logging.debug('')
 
-    fallctrs, f, d = fmin_l_bfgs_b(chisq_position_sky_sn_multi, allctrs0,
-                                   args=(galaxy, datas, weights, atms),
-                                   iprint=0, callback=callback, bounds=bounds)
-    _check_result(d['warnflag'], d['task'])
-    _log_result("fmin_l_bfgs_b", f, d['nit'], d['funcalls'])
+    #logging.debug('Bounds:')
+    # this was wrong
+    #logging.debug('')
+    
+    # iminuit version
+    # -------------------------------------------------------
+    param_names = []
+    for i in range(len(datas)):
+        param_names.extend(("y%d" % i, "x%d" % i))
+    param_names.extend(("ysn", "xsn"))
+
+    # initial values, step sizes, and bounds
+    kwargs = {}
+    for i, name in enumerate(param_names):
+        kwargs[name] = allctrs0[i]
+        kwargs["error_" + name] = 0.01
+        kwargs["limit_" + name] = bounds[i]
+
+    logging.debug("Initial position parameters:")
+    for name in param_names:
+        logging.debug("        %s : %7.4f [%7.4f, %7.4f]", name, kwargs[name],
+                      kwargs["limit_" + name][0], kwargs["limit_" + name][1])
+
+    verbose = True
+    m = iminuit.Minuit(objective_func, errordef=1.,
+                       forced_parameters=param_names,
+                       print_level=(1 if verbose else 0),
+                       throw_nan=True, **kwargs)
+    d, l = m.migrad(ncall=10000)
+
+    # Build a message.
+    message = []
+    if d.has_reached_call_limit:
+        message.append('Reached call limit.')
+    if d.hesse_failed:
+        message.append('Hesse Failed.')
+    if not d.has_covariance:
+        message.append('No covariance.')
+    elif not d.has_accurate_covar:  # iminuit docs wrong
+        message.append('Covariance may not be accurate.')
+    if not d.has_posdef_covar:  # iminuit docs wrong
+        message.append('Covariance not positive definite.')
+    if d.has_made_posdef_covar:
+        message.append('Covariance forced positive definite.')
+    if not d.has_valid_parameters:
+        message.append('Parameter(s) value and/or error invalid.')
+    if len(message) == 0:
+        message.append('Minimization exited successfully.')
+        # iminuit: m.np_matrix() doesn't work
+
+    # numpy array of best-fit values
+    fallctrs = np.array([m.values[name] for name in param_names])
+    logging.debug("Final position parameters:")
+    for name in param_names:
+        logging.debug("        %s : %7.4f [%7.4f, %7.4f]", name, m.values[name],
+                      kwargs["limit_" + name][0], kwargs["limit_" + name][1])
+
+
+    #fallctrs, fval, niter, ncall, warnflag = fmin(objective_func, allctrs0,
+    #                                              full_output=1, disp=0)
+    #_check_result_fmin(warnflag)
+    #_log_result("fmin", fval, niter, ncall)
+
+
+    #fallctrs, f, d = fmin_l_bfgs_b(chisq_position_sky_sn_multi, allctrs0,
+    #                               args=(galaxy, datas, weights, atms),
+    #                               iprint=0, callback=callback, bounds=bounds)
+    #_check_result(d['warnflag'], d['task'])
+    #_log_result("fmin_l_bfgs_b", f, d['nit'], d['funcalls'])
 
     # pull out fitted positions
     fallctrs = fallctrs.reshape((nepochs+1, 2))

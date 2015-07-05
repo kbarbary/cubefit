@@ -4,7 +4,7 @@ import copy
 import logging
 
 import numpy as np
-from scipy.optimize import fmin_l_bfgs_b, fmin_bfgs, fmin
+from scipy.optimize import fmin_l_bfgs_b, fmin, fmin_ncg
 
 from .utils import yxbounds
 
@@ -477,7 +477,249 @@ def chisq_position_sky_sn_multi(allctrs, galaxy, datas, weights, atms):
     # reshape gradient to 1-d upon return.
     return chisq, np.ravel(grad)
 
+
+def chisq_nonref_epoch(ctr, snctr, galaxy, data, weight, atm):
+    """Chisq for a non-ref epoch (with SN) given data position and SN position.
+    """
+    gal = atm.evaluate_galaxy(galaxy, data.shape[1:3], ctr)
+    psf = atm.evaluate_point_source(snctr, data.shape[1:3], ctr)
+    sky, sn = determine_sky_and_sn(gal, psf, data, weight)
+    scene = sky[:, None, None] + gal + sn[:, None, None] * psf
+    return np.sum(weight * (data - scene)**2)
+
+
+def chisq_pssm(allctrs, galaxy, datas, weights, atms):
+    """Chisq function for fit_position_sky_sn_multi()"""
+
+#    logging.debug("val @ %s", allctrs)
+
+    nepochs = len(datas)
+    snctr = tuple(allctrs[2*nepochs:])
+
+    chisq = 0.
+    for i in range(nepochs):
+        chisq += chisq_nonref_epoch(tuple(allctrs[2*i: 2*i+2]), snctr,
+                                    galaxy, datas[i], weights[i], atms[i])
+
+    return chisq
+
+def chisq_pssm_grad(allctrs, galaxy, datas, weights, atms):
+    """Gradient on chisq_pssm()"""
+
+#    logging.debug("grad @ %s", allctrs)
+
+    EPS = 0.02
+
+    nepochs = len(datas)
+    snyctr, snxctr = allctrs[2*nepochs:]
+
+    grad = np.zeros_like(allctrs)
+    for i in range(nepochs):
+        yctr, xctr = allctrs[2*i: 2*i+2]
+
+        # nominal chisq
+        chisq = chisq_nonref_epoch((yctr, xctr), (snyctr, snxctr),
+                                   galaxy, datas[i], weights[i], atms[i])
+
+        # change data position
+        chisq2 = chisq_nonref_epoch((yctr+EPS, xctr), (snyctr, snxctr),
+                                    galaxy, datas[i], weights[i], atms[i])
+        grad[2*i] += (chisq2 - chisq) / EPS
+        chisq2 = chisq_nonref_epoch((yctr, xctr+EPS), (snyctr, snxctr),
+                                    galaxy, datas[i], weights[i], atms[i])
+        grad[2*i+1] += (chisq2 - chisq) / EPS
+
+        # change sn position
+        chisq2 = chisq_nonref_epoch((yctr, xctr), (snyctr+EPS, snxctr),
+                                    galaxy, datas[i], weights[i], atms[i])
+        grad[2*nepochs] += (chisq2 - chisq) / EPS
+        chisq2 = chisq_nonref_epoch((yctr, xctr), (snyctr, snxctr+EPS),
+                                    galaxy, datas[i], weights[i], atms[i])
+        grad[2*nepochs+1] += (chisq2 - chisq) / EPS
+
+    return grad
+
+
+def chisq_pssm_hess(allctrs, galaxy, datas, weights, atms):
+    """Hessian on chisq_pssm()"""
+
+#    logging.debug("hess @ %s", allctrs)
+
+    EPS = 0.02
+    EPS2 = EPS*EPS
+
+    nepochs = len(datas)
+    snyctr, snxctr = allctrs[2*nepochs:]
+
+    hess = np.zeros((len(allctrs), len(allctrs)))
+    for i in range(nepochs):
+        yctr, xctr = allctrs[2*i: 2*i+2]
+
+        # nominal chisq
+        c0 = chisq_nonref_epoch((yctr, xctr), (snyctr, snxctr),
+                                galaxy, datas[i], weights[i], atms[i])
+
+        # chisq terms, data positions only:
+        cyy = chisq_nonref_epoch((yctr+2.0*EPS, xctr), (snyctr, snxctr),
+                                 galaxy, datas[i], weights[i], atms[i])
+        cxx = chisq_nonref_epoch((yctr, xctr+2.0*EPS), (snyctr, snxctr),
+                                 galaxy, datas[i], weights[i], atms[i])
+        cyx = chisq_nonref_epoch((yctr+EPS, xctr+EPS), (snyctr, snxctr),
+                                 galaxy, datas[i], weights[i], atms[i])
+        cy = chisq_nonref_epoch((yctr+EPS, xctr), (snyctr, snxctr),
+                                galaxy, datas[i], weights[i], atms[i])
+        cx = chisq_nonref_epoch((yctr, xctr+EPS), (snyctr, snxctr),
+                                galaxy, datas[i], weights[i], atms[i])
+
+        # Hessian has 4 nonzero entries near the diagonal
+        hess[2*i, 2*i] = (cyy - 2.0*cy + c0) / EPS2
+        hess[2*i+1, 2*i+1] = (cxx - 2.0*cx + c0) / EPS2
+        hess[2*i, 2*i+1] = (cyx - cy - cx + c0) / EPS2
+        hess[2*i+1, 2*i] = hess[2*i, 2*i+1]
+
+
+        # Terms for just the SN positions:
+        # (here, z refers to sny and w refers to snx)
+        czz = chisq_nonref_epoch((yctr, xctr), (snyctr+2.0*EPS, snxctr),
+                                 galaxy, datas[i], weights[i], atms[i])
+        cww = chisq_nonref_epoch((yctr, xctr), (snyctr, snxctr+2.0*EPS),
+                                 galaxy, datas[i], weights[i], atms[i])
+        czw = chisq_nonref_epoch((yctr, xctr), (snyctr+EPS, snxctr+EPS),
+                                 galaxy, datas[i], weights[i], atms[i])
+        cz = chisq_nonref_epoch((yctr, xctr), (snyctr+EPS, snxctr),
+                                galaxy, datas[i], weights[i], atms[i])
+        cw = chisq_nonref_epoch((yctr, xctr), (snyctr, snxctr+EPS),
+                                galaxy, datas[i], weights[i], atms[i])
+
+        # We *add* to the hessian at the SN positions:
+        hess[2*nepochs, 2*nepochs] += (czz - 2.0*cz + c0) / EPS2
+        hess[2*nepochs+1, 2*nepochs+1] += (cww - 2.0*cw + c0) / EPS2
+        hess[2*nepochs, 2*nepochs+1] += (czw - cz - cw + c0) / EPS2
+        hess[2*nepochs+1, 2*nepochs] += (czw - cz - cw + c0) / EPS2
+
+
+        # terms mixing data position and SN position
+        cyz = chisq_nonref_epoch((yctr+EPS, xctr), (snyctr+EPS, snxctr),
+                                 galaxy, datas[i], weights[i], atms[i])
+        cyw = chisq_nonref_epoch((yctr+EPS, xctr), (snyctr, snxctr+EPS),
+                                 galaxy, datas[i], weights[i], atms[i])
+        cxz = chisq_nonref_epoch((yctr, xctr+EPS), (snyctr+EPS, snxctr),
+                                 galaxy, datas[i], weights[i], atms[i])
+        cxw = chisq_nonref_epoch((yctr, xctr+EPS), (snyctr, snxctr+EPS),
+                                 galaxy, datas[i], weights[i], atms[i])
+
+        # Hessian has 4 nonzero entries (in both upper and lower triangle)
+        # at the intersection of the data and SN positions.
+        hess[2*i, 2*nepochs] = (cyz - cy - cz - c0) / EPS2
+        hess[2*i, 2*nepochs+1] = (cyw - cy - cw - c0) / EPS2
+        hess[2*i+1, 2*nepochs] = (cxz - cx - cz - c0) / EPS2
+        hess[2*i+1, 2*nepochs+1] = (cxw - cx - cw - c0) / EPS2
+
+        hess[2*nepochs, 2*i] = hess[2*i, 2*nepochs]
+        hess[2*nepochs+1, 2*i] = hess[2*i, 2*nepochs+1]
+        hess[2*nepochs, 2*i+1] = hess[2*i+1, 2*nepochs]
+        hess[2*nepochs+1, 2*i+1] = hess[2*i+1, 2*nepochs+1]
+
+    return hess
+
+
+
 def fit_position_sky_sn_multi(galaxy, datas, weights, ctrs0, snctr0, atms):
+    """Fit data pointing (nepochs), SN position (in model frame),
+    SN amplitude (nepochs), and sky level (nepochs). This is meant to be
+    used only on epochs with SN light.
+
+    Parameters
+    ----------
+    galaxy : ndarray (3-d)
+    datas : list of ndarray (3-d)
+    weights : list of ndarray (3-d)
+    ctrs0 : list of tuples
+        Initial data positions (y, x)
+    snctr0 : tuple
+        Initial SN position.
+    atms : list of AtmModels
+
+    Returns
+    -------
+    fctrs : list of tuples
+        Fitted data positions.
+    fsnctr : tuple
+        Fitted SN position.
+    skys : list of ndarray (1-d)
+        FItted sky spectra for each epoch.
+    sne : list of ndarray (1-d)
+        Fitted SN spectra for each epoch.
+
+    Notes
+    -----
+    Given the data pointing and SN position, determining
+    the sky level and SN amplitude is a linear problem. Therefore, we
+    have only the data pointing and sn position as parameters in the
+    (nonlinear) optimization and determine the sky and sn amplitude in
+    each iteration.
+    """
+
+    BOUND = 2. # +/- position bound in spaxels
+
+    nepochs = len(datas)
+    assert len(weights) == len(ctrs0) == len(atms) == nepochs
+
+    # Initial parameter array. Has order [y0, x0, y1, x1, ... , ysn, xsn].
+    allctrs0 = np.ravel(np.vstack((ctrs0, snctr0)))
+
+    # Default parameter bounds for all parameters.
+    minbound = allctrs0 - BOUND
+    maxbound = allctrs0 + BOUND
+
+    # For data position parameters, check that bounds do not extend
+    # past the edge of the model and adjust the minbound and maxbound.
+    # For SN position bounds, we don't do any checking like this.
+    gshape = galaxy.shape[1:3]  # model shape
+    for i in range(nepochs):
+        dshape = datas[i].shape[1:3]
+        (yminabs, ymaxabs), (xminabs, xmaxabs) = yxbounds(gshape, dshape)
+        minbound[2*i] = max(minbound[2*i], yminabs)  # ymin
+        maxbound[2*i] = min(maxbound[2*i], ymaxabs)  # ymax
+        minbound[2*i+1] = max(minbound[2*i+1], xminabs)  # xmin
+        maxbound[2*i+1] = min(maxbound[2*i+1], xmaxabs)  # xmax
+
+    bounds = zip(minbound, maxbound)  # [(y0min, y0max), (x0min, x0max), ...]
+
+    def callback(params):
+        for i in range(len(params)//2-1):
+            logging.debug('Epoch %s: %s, %s', i, params[2*i], params[2*i+1])
+        logging.debug('SN position %s, %s', params[-2], params[-1])
+    logging.debug('Bounds:')
+    callback(bounds)
+    logging.debug('')
+
+    res = fmin_ncg(chisq_pssm, allctrs0, chisq_pssm_grad, fhess=chisq_pssm_hess,
+                   args=(galaxy, datas, weights, atms), callback=callback, avextol=1e-2)
+    fallctrs, f, fcalls, gcalls, hcalls, warnflag = res
+    #_check_result(warnflag, d['task'])
+    _log_result("fmin_ncg", f, None, fcalls)
+
+    # pull out fitted positions
+    fallctrs = fallctrs.reshape((nepochs+1, 2))
+    fsnctr = tuple(fallctrs[nepochs, :])
+    fctrs = [tuple(fallctrs[i, :]) for i in range(nepochs)]
+
+    # evaluate final sky and sn in each epoch
+    skys = []
+    sne = []
+    for i in range(nepochs):
+        gal = atms[i].evaluate_galaxy(galaxy, datas[i].shape[1:3], fctrs[i])
+        psf = atms[i].evaluate_point_source(fsnctr, datas[i].shape[1:3],
+                                            fctrs[i])
+        sky, sn = determine_sky_and_sn(gal, psf, datas[i], weights[i])
+        skys.append(sky)
+        sne.append(sn)
+
+    return fctrs, fsnctr, skys, sne
+
+
+def fit_position_sky_sn_multi_old(galaxy, datas, weights, ctrs0, snctr0, atms):
     """Fit data pointing (nepochs), SN position (in model frame),
     SN amplitude (nepochs), and sky level (nepochs). This is meant to be
     used only on epochs with SN light.

@@ -6,6 +6,8 @@ import logging
 import numpy as np
 from scipy.optimize import fmin_l_bfgs_b, fmin_bfgs, fmin
 
+import nestle
+
 from .utils import yxbounds
 
 __all__ = ["guess_sky", "fit_galaxy_single", "fit_galaxy_sky_multi",
@@ -422,6 +424,159 @@ def fit_position_sky(galaxy, data, weight, ctr0, atm):
 
     return tuple(ctr), sky
 
+# -----------------------------------------------------------------------------
+# Testing sampling method
+
+def chisq_nonref_epoch(ctr, snctr, galaxy, data, weight, atm):
+    """Chisq for a non-ref epoch (with SN) given data position and SN position.
+    """
+    gal = atm.evaluate_galaxy(galaxy, data.shape[1:3], ctr)
+    psf = atm.evaluate_point_source(snctr, data.shape[1:3], ctr)
+    sky, sn = determine_sky_and_sn(gal, psf, data, weight)
+    scene = sky[:, None, None] + gal + sn[:, None, None] * psf
+    return np.sum(weight * (data - scene)**2)
+
+
+def chisq_pssm(allctrs, galaxy, datas, weights, atms):
+    """Chisq function for fit_position_sky_sn_multi()"""
+
+    nepochs = len(datas)
+    snctr = tuple(allctrs[2*nepochs:])
+
+    chisq = 0.
+    for i in range(nepochs):
+        chisq += chisq_nonref_epoch(tuple(allctrs[2*i: 2*i+2]), snctr,
+                                    galaxy, datas[i], weights[i], atms[i])
+
+    return chisq
+
+
+def fit_position_sky_sn_multi(galaxy, datas, weights, ctrs0, snctr0, atms):
+    """Fit data pointing (nepochs), SN position (in model frame),
+    SN amplitude (nepochs), and sky level (nepochs). This is meant to be
+    used only on epochs with SN light.
+
+    Parameters
+    ----------
+    galaxy : ndarray (3-d)
+    datas : list of ndarray (3-d)
+    weights : list of ndarray (3-d)
+    ctrs0 : list of tuples
+        Initial data positions (y, x)
+    snctr0 : tuple
+        Initial SN position.
+    atms : list of AtmModels
+
+    Returns
+    -------
+    fctrs : list of tuples
+        Fitted data positions.
+    fsnctr : tuple
+        Fitted SN position.
+    skys : list of ndarray (1-d)
+        FItted sky spectra for each epoch.
+    sne : list of ndarray (1-d)
+        Fitted SN spectra for each epoch.
+
+    Notes
+    -----
+    Given the data pointing and SN position, determining
+    the sky level and SN amplitude is a linear problem. Therefore, we
+    have only the data pointing and sn position as parameters in the
+    (nonlinear) optimization and determine the sky and sn amplitude in
+    each iteration.
+    """
+
+    BOUND = 2.0 # +/- position bound in spaxels
+
+    nepochs = len(datas)
+    gshape = galaxy.shape[1:3]  # model shape
+
+    # loop over epochs, run a sampler for each.
+    samples = []
+    for i in range(nepochs):
+        data, weight, ctr0, atm = datas[i], weights[i], ctrs0[i], atms[i]
+
+        p = np.array([ctr0[0], ctr0[1], snctr0[0], snctr0[1]])  # parameters
+        pmin = p - BOUND
+        pmax = p + BOUND
+        
+        # check that bounds don't extend past edge of the model.
+        (yminabs, ymaxabs), (xminabs, xmaxabs) = yxbounds(gshape,
+                                                          data.shape[1:3])
+        pmin[0] = max(pmin[0], yminabs)  # ymin
+        pmax[0] = min(pmax[0], ymaxabs)  # ymax
+        pmin[1] = max(pmin[1], xminabs)  # xmin
+        pmax[1] = min(pmax[1], xmaxabs)  # xmax
+
+        # Posterior function.
+        def lnprob(p):
+            #if (p < pmin).any() or (p > pmax).any():
+            #    return -np.inf
+            val = -0.5 * chisq_nonref_epoch(tuple(p[0:2]), tuple(p[2:]),
+                                            galaxy, data, weight, atm)
+            return val
+
+        # maps [0, 1] to [pmin, pmax]
+        def prior(v):
+            return pmin + (pmax - pmin) * v
+
+        res = nestle.nest(lnprob, prior, 4, verbose=True)
+
+        # Run the sampler.
+        #nwalkers = 10
+        #nburn = 50
+        #nsamples = 100
+        #thin = 1
+        #ndim = len(p)
+        #pos = p + 0.02 * np.random.normal(size=(nwalkers, ndim))
+        #sampler = emcee.EnsembleSampler(nwalkers, ndim, lnprob)
+        #pos, prob, state = sampler.run_mcmc(pos, nburn)  # burn-in
+        #sampler.reset()
+        #sampler.run_mcmc(pos, nsamples, thin=thin)  # production run
+        #samples = sampler.flatchain
+
+        # Summary statistics.
+        #fallctrs = np.mean(res.samples, weights=res.weights, axis=0)
+        #cov = np.cov(samples, rowvar=0)
+        #errors = np.sqrt(np.diagonal(cov))
+
+        logging.info("        epoch %d sampling complete.", i)
+
+        # save samples for testing.
+        with open("%d.npy"%i, "w") as f:
+            np.savez(f, samples=res.samples, weights=res.weights)
+
+        #logging.info(u"        %d : %6.4f \u00B1 %6.4f",
+        #             i, fallctrs[i], errors[i])
+
+
+    # pull out fitted positions
+    fallctrs = fallctrs.reshape((nepochs+1, 2))
+    fsnctr = tuple(fallctrs[nepochs, :])
+    fctrs = [tuple(fallctrs[i, :]) for i in range(nepochs)]
+
+    # save samples for testing.
+    with open("samples.npy", "w") as f:
+        np.save(f, samples)
+
+
+    # evaluate final sky and sn in each epoch
+    skys = []
+    sne = []
+    for i in range(nepochs):
+        gal = atms[i].evaluate_galaxy(galaxy, datas[i].shape[1:3], fctrs[i])
+        psf = atms[i].evaluate_point_source(fsnctr, datas[i].shape[1:3],
+                                            fctrs[i])
+        sky, sn = determine_sky_and_sn(gal, psf, datas[i], weights[i])
+        skys.append(sky)
+        sne.append(sn)
+
+    return fctrs, fsnctr, skys, sne
+
+# -----------------------------------------------------------------------------
+# older code
+
 def chisq_position_sky_sn_multi(allctrs, galaxy, datas, weights, atms):
     """Function to minimize. `allctrs` is a 1-d ndarray:
 
@@ -477,7 +632,7 @@ def chisq_position_sky_sn_multi(allctrs, galaxy, datas, weights, atms):
     # reshape gradient to 1-d upon return.
     return chisq, np.ravel(grad)
 
-def fit_position_sky_sn_multi(galaxy, datas, weights, ctrs0, snctr0, atms):
+def fit_position_sky_sn_multi_old(galaxy, datas, weights, ctrs0, snctr0, atms):
     """Fit data pointing (nepochs), SN position (in model frame),
     SN amplitude (nepochs), and sky level (nepochs). This is meant to be
     used only on epochs with SN light.
